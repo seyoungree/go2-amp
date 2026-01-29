@@ -1,3 +1,17 @@
+# scripts/retarget_a1_go2.py
+"""
+A1 -> Go2 retargeting using MuJoCo FK (A1) -> IK (Go2) with BODY-based feet (robust for Menagerie).
+Outputs:
+  retarget_out/go2_qpos.npy   (T, nq)
+  retarget_out/go2_qvel.npy   (T, nv)  (hinge finite-diff; base vel zeros)
+  retarget_out/go2_ref_obs.npy (T, nq+nv)
+
+Usage (from repo root):
+  conda activate go2-retarget
+  git submodule update --init --recursive
+  python scripts/retarget_a1_go2.py
+"""
+
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -6,12 +20,12 @@ import numpy as np
 import mujoco
 
 
-MENAGERIE_DIR = Path("mujoco_menagerie")  # cloned repo folder
+MENAGERIE_DIR = Path("deps/mujoco_menagerie")
 A1_XML = MENAGERIE_DIR / "unitree_a1" / "scene.xml"
 GO2_XML = MENAGERIE_DIR / "unitree_go2" / "scene.xml"
 
-AMP_HW_DIR = Path("AMP_for_hardware")  # cloned repo folder
-MOTION_FILE = AMP_HW_DIR / "datasets" / "mocap_motions" / "walk.txt"  # change to trot.txt etc if present
+AMP_HW_DIR = Path("deps/AMP_for_hardware")
+MOTION_FILE = AMP_HW_DIR / "datasets" / "mocap_motions" / "trot0.txt" 
 
 OUT_DIR = Path("retarget_out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -21,9 +35,9 @@ IK_ITERS = 25
 IK_DAMPING = 1e-2
 IK_STEP_SCALE = 0.7
 
-# Quaternion format in motion file:
-#   - "wxyz" is common in AMP pipelines
-#   - if your results look wrong, set this to "xyzw"
+# Quaternion format inside AMP motion frames:
+# - Many AMP pipelines use wxyz
+# - If your retargeted playback looks rotated, set to "xyzw"
 ROOT_QUAT_FORMAT = "wxyz"  # or "xyzw"
 
 
@@ -72,11 +86,14 @@ def quat_to_wxyz(q: np.ndarray) -> np.ndarray:
 
 def quat_wxyz_to_mat(qwxyz: np.ndarray) -> np.ndarray:
     w, x, y, z = map(float, qwxyz)
-    return np.array([
-        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
-        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
-        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
-    ], dtype=np.float64)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
 
 
 def load_amp_motion_file(path: str) -> Tuple[float, np.ndarray]:
@@ -110,57 +127,93 @@ def parse_frame(frame: np.ndarray) -> Dict[str, np.ndarray]:
     }
 
 
-def find_foot_sites(model: mujoco.MjModel) -> List[int]:
-    """Heuristic: pick site names containing 'foot' or 'toe'."""
+# =========================
+# Feet as BODIES (not sites)
+# =========================
+def find_foot_bodies(model: mujoco.MjModel) -> List[int]:
+    """
+    Heuristic: pick 4 body names likely to be feet.
+    Menagerie often uses bodies/geoms for feet (sites may be absent).
+    """
+    keywords = ["foot", "toe", "ankle"]
     cands = []
-    for sid in range(model.nsite):
-        nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, sid)
+    for bid in range(model.nbody):
+        nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
         if not nm:
             continue
         low = nm.lower()
-        if ("foot" in low) or ("toe" in low):
-            cands.append(sid)
+        if any(k in low for k in keywords):
+            cands.append(bid)
+
+    # fallback: sometimes terminal body contains calf/shank naming
     if len(cands) < 4:
-        raise RuntimeError(f"Could not find 4 foot/toe sites; found {len(cands)}. Set explicit site names.")
-    # stable subset
-    cands = sorted(cands, key=lambda sid: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, sid))[:4]
-    return cands
+        for bid in range(model.nbody):
+            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+            if not nm:
+                continue
+            low = nm.lower()
+            if "calf" in low:
+                cands.append(bid)
+
+    # stable + unique
+    cands = sorted(set(cands), key=lambda bid: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid) or "")
+    if len(cands) < 4:
+        # print some hints to help you hardcode names
+        names = []
+        for bid in range(model.nbody):
+            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+            if nm:
+                names.append(nm)
+        raise RuntimeError(
+            f"Could not find 4 foot/toe/ankle/calf bodies; found {len(cands)}.\n"
+            f"Tip: inspect body names and hardcode them.\n"
+            f"Example: print names containing 'FR', 'FL', 'RR', 'RL' etc.\n"
+            f"Total bodies with names: {len(names)}"
+        )
+    return cands[:4]
 
 
-def label_feet_by_pose(model: mujoco.MjModel, data: mujoco.MjData, site_ids: List[int]) -> Dict[str, int]:
+def label_feet_by_pose_body(model: mujoco.MjModel, data: mujoco.MjData, body_ids: List[int]) -> Dict[str, int]:
     """
-    Assign FR/FL/RR/RL by world x(front/back) and y(left/right) at current pose.
-    Convention: +y is left in MuJoCo.
+    Assign FR/FL/RR/RL by body world position:
+      x: front/back, y: left/right (+y is left)
     """
     pts = []
-    for sid in site_ids:
-        pos = data.site_xpos[sid].copy()
-        pts.append((sid, pos[0], pos[1]))
+    for bid in body_ids:
+        pos = data.xpos[bid].copy()  # body frame origin in world
+        pts.append((bid, pos[0], pos[1]))
 
     pts_sorted_x = sorted(pts, key=lambda t: t[1], reverse=True)
     front = pts_sorted_x[:2]
     rear = pts_sorted_x[2:]
 
-    fr = min(front, key=lambda t: t[2])[0]
-    fl = max(front, key=lambda t: t[2])[0]
+    fr = min(front, key=lambda t: t[2])[0]  # smaller y => right
+    fl = max(front, key=lambda t: t[2])[0]  # larger y => left
     rr = min(rear, key=lambda t: t[2])[0]
     rl = max(rear, key=lambda t: t[2])[0]
     return {"FR": fr, "FL": fl, "RR": rr, "RL": rl}
 
 
-def feet_local_positions(model: mujoco.MjModel, data: mujoco.MjData, feet: Dict[str, int]) -> Dict[str, np.ndarray]:
-    """Foot positions in base frame (local to root)."""
+def feet_local_positions_body(data: mujoco.MjData, feet: Dict[str, int]) -> Dict[str, np.ndarray]:
+    """
+    Foot body positions in base frame (local to root).
+    Assumes freejoint: qpos[0:3]=pos, qpos[3:7]=quat(wxyz)
+    """
     base_pos = data.qpos[0:3].copy()
     base_quat = data.qpos[3:7].copy()
     R = quat_wxyz_to_mat(base_quat)
     Rt = R.T
+
     out = {}
-    for leg, sid in feet.items():
-        p_w = data.site_xpos[sid].copy()
+    for leg, bid in feet.items():
+        p_w = data.xpos[bid].copy()
         out[leg] = Rt @ (p_w - base_pos)
     return out
 
 
+# =========================
+# IK on Go2 using BODY jacobians
+# =========================
 def build_joint_index_map(model: mujoco.MjModel, joint_names: List[str]) -> Tuple[np.ndarray, np.ndarray]:
     qpos_adrs, dof_adrs = [], []
     for jn in joint_names:
@@ -178,10 +231,12 @@ def solve_ik_go2(
     target_local: Dict[str, np.ndarray],
 ):
     """
-    Damped least squares IK on 12 hinge joints.
-    Root pose stays at whatever is currently in data.qpos[0:7].
+    Damped least squares IK:
+      - matches 4 foot BODY positions (12 constraints) using 12 hinge joints
+      - leaves root pose fixed
     """
     qpos_adrs, dof_adrs = build_joint_index_map(model, joint_names)
+
     jacp = np.zeros((3, model.nv), dtype=np.float64)
     jacr = np.zeros((3, model.nv), dtype=np.float64)
 
@@ -195,16 +250,16 @@ def solve_ik_go2(
 
         r_list, J_list = [], []
         for leg in ["FR", "FL", "RR", "RL"]:
-            sid = feet[leg]
-            p = data.site_xpos[sid].copy()
-            r = (target_world[leg] - p)
+            bid = feet[leg]
+            p = data.xpos[bid].copy()
+            r = target_world[leg] - p
             r_list.append(r)
 
-            mujoco.mj_jacSite(model, data, jacp, jacr, sid)
-            J_list.append(jacp[:, dof_adrs])
+            mujoco.mj_jacBody(model, data, jacp, jacr, bid)
+            J_list.append(jacp[:, dof_adrs])  # (3, 12)
 
-        r_stack = np.concatenate(r_list, axis=0)     # (12,)
-        J_stack = np.concatenate(J_list, axis=0)     # (12,12)
+        r_stack = np.concatenate(r_list, axis=0)  # (12,)
+        J_stack = np.concatenate(J_list, axis=0)  # (12, 12)
 
         if np.linalg.norm(r_stack) < 1e-4:
             break
@@ -218,7 +273,18 @@ def solve_ik_go2(
     mujoco.mj_forward(model, data)
 
 
+# =========================
+# Main
+# =========================
 def main():
+    # Validate paths early
+    if not A1_XML.exists():
+        raise FileNotFoundError(f"A1_XML not found: {A1_XML}")
+    if not GO2_XML.exists():
+        raise FileNotFoundError(f"GO2_XML not found: {GO2_XML}")
+    if not MOTION_FILE.exists():
+        raise FileNotFoundError(f"MOTION_FILE not found: {MOTION_FILE}")
+
     # Load models
     a1_model = mujoco.MjModel.from_xml_path(str(A1_XML))
     a1_data = mujoco.MjData(a1_model)
@@ -230,28 +296,29 @@ def main():
     mujoco.mj_resetData(go2_model, go2_data)
     mujoco.mj_forward(go2_model, go2_data)
 
-    # Foot sites + labeling
-    a1_feet = label_feet_by_pose(a1_model, a1_data, find_foot_sites(a1_model))
-    go2_feet = label_feet_by_pose(go2_model, go2_data, find_foot_sites(go2_model))
-    print("A1 feet:", {k: mujoco.mj_id2name(a1_model, mujoco.mjtObj.mjOBJ_SITE, v) for k, v in a1_feet.items()})
-    print("Go2 feet:", {k: mujoco.mj_id2name(go2_model, mujoco.mjtObj.mjOBJ_SITE, v) for k, v in go2_feet.items()})
+    # Feet bodies + labeling
+    a1_feet = label_feet_by_pose_body(a1_model, a1_data, find_foot_bodies(a1_model))
+    go2_feet = label_feet_by_pose_body(go2_model, go2_data, find_foot_bodies(go2_model))
 
-    # Actuated joints (use first 12)
+    print("A1 foot bodies:", {k: mujoco.mj_id2name(a1_model, mujoco.mjtObj.mjOBJ_BODY, v) for k, v in a1_feet.items()})
+    print("Go2 foot bodies:", {k: mujoco.mj_id2name(go2_model, mujoco.mjtObj.mjOBJ_BODY, v) for k, v in go2_feet.items()})
+
+    # Actuated joints (first 12)
     a1_joints = get_actuated_joint_names(a1_model)[:12]
     go2_joints = get_actuated_joint_names(go2_model)[:12]
     if len(a1_joints) < 12 or len(go2_joints) < 12:
         raise RuntimeError(f"Expected 12 actuated joints. Got A1={len(a1_joints)} Go2={len(go2_joints)}")
+
     print("A1 joints:", a1_joints)
     print("Go2 joints:", go2_joints)
 
     # Load motion frames
     dt, frames = load_amp_motion_file(str(MOTION_FILE))
     T = frames.shape[0]
-    print(f"Loaded motion {MOTION_FILE}  frames={frames.shape}  dt={dt}")
+    print(f"Loaded motion: {MOTION_FILE}  frames={frames.shape}  dt={dt}  quat={ROOT_QUAT_FORMAT}")
 
     go2_qpos = np.zeros((T, go2_model.nq), dtype=np.float32)
     go2_qvel = np.zeros((T, go2_model.nv), dtype=np.float32)
-
     prev_qpos = None
 
     # Retarget per frame
@@ -267,12 +334,13 @@ def main():
 
         mujoco.mj_forward(a1_model, a1_data)
 
-        # Feet in base frame
-        a1_local = feet_local_positions(a1_model, a1_data, a1_feet)
+        # A1 feet in base frame (local)
+        a1_local = feet_local_positions_body(a1_data, a1_feet)
 
-        # Solve IK on Go2 (root stays at default pose)
+        # Solve IK on Go2 to match A1 feet local targets (root fixed at default)
         solve_ik_go2(go2_model, go2_data, go2_joints, go2_feet, a1_local)
 
+        # Save qpos
         go2_qpos[t] = go2_data.qpos.copy().astype(np.float32)
 
         # Approx qvel: hinge finite-diff only; base vel zeros (starter)
@@ -294,7 +362,7 @@ def main():
     np.save(OUT_DIR / "go2_qpos.npy", go2_qpos)
     np.save(OUT_DIR / "go2_qvel.npy", go2_qvel)
     np.save(OUT_DIR / "go2_ref_obs.npy", np.concatenate([go2_qpos, go2_qvel], axis=1))
-    print("Saved outputs in", OUT_DIR)
+    print("Saved outputs in:", OUT_DIR.resolve())
 
 
 if __name__ == "__main__":

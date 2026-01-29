@@ -5,7 +5,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 
-MENAGERIE_DIR = Path("mujoco_menagerie")
+MENAGERIE_DIR = Path("deps/mujoco_menagerie")
 GO2_XML = MENAGERIE_DIR / "unitree_go2" / "scene.xml"
 
 QPOS_PATH = Path("retarget_out/go2_qpos.npy")
