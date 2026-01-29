@@ -1,0 +1,9 @@
+name: go2-amp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pip:
+      - mujoco>=3.1.0

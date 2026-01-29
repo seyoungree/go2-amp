@@ -1,0 +1,6 @@
+[submodule "deps/mujoco_menagerie"]
+	path = deps/mujoco_menagerie
+	url = https://github.com/google-deepmind/mujoco_menagerie.git
+[submodule "deps/AMP_for_hardware"]
+	path = deps/AMP_for_hardware
+	url = https://github.com/escontra/AMP_for_hardware.git
